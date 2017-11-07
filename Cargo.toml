@@ -1,6 +1,6 @@
 [package]
 name = "tokio-shared-udp-socket"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Andrew Cann <shum@canndrew.org>"]
 description = "Easily share a UDP socket between different futures in tokio"
 repository = "https://github.com/canndrew/tokio-shared-udp-socket"
