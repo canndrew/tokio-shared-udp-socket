@@ -13,33 +13,45 @@ use std::{mem, io};
 use std::collections::{hash_map, HashMap};
 use std::sync::{Arc, Mutex};
 use std::net::SocketAddr;
-use bytes::Bytes;
-use futures::{Async, AsyncSink, Stream, Sink};
+use bytes::{BytesMut, Bytes};
+use futures::{future, Async, AsyncSink, Stream, Sink};
+use futures::task::{self, Task};
 use future_utils::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use future_utils::{BoxFuture, FutureExt};
 use tokio_core::net::UdpSocket;
-use void::{ResultVoidExt};
+use void::{Void, ResultVoidExt};
 
 /// A UDP socket that can easily be shared amongst a bunch of different futures.
-///
-/// `SharedUdpSocket` can be used as a `Stream` to receive incoming packets along with their
-/// addresses. The `with_address` method can be used to divert packets from a given address to a
-/// seperate `Stream` so they can be processed seperately.
 pub struct SharedUdpSocket {
+    some: Option<SomeSharedUdpSocket>,
+}
+
+struct SomeSharedUdpSocket {
     inner: Arc<SharedUdpSocketInner>,
-    incoming_rx: UnboundedReceiver<(SocketAddr, Bytes)>,
+    incoming_rx: UnboundedReceiver<WithAddress>,
+    buffer: BytesMut,
 }
 
 /// A `Sink`/`Stream` that can be used to send/receive packets to/from a particular address.
+/// 
+/// These can be created by calling `SharedUdpSocket::with_address`. `SharedUdpSocket` will also
+/// yield these (when used as a `Stream`) when it receives a packet from a new address.
 pub struct WithAddress {
+    some: Option<SomeWithAddress>,
+}
+
+struct SomeWithAddress {
     inner: Arc<SharedUdpSocketInner>,
     incoming_rx: UnboundedReceiver<Bytes>,
     addr: SocketAddr,
+    buffer: BytesMut,
 }
 
 struct SharedUdpSocketInner {
     socket: UdpSocket,
     with_addresses: Mutex<HashMap<SocketAddr, UnboundedSender<Bytes>>>,
-    incoming_tx: UnboundedSender<(SocketAddr, Bytes)>,
+    incoming_tx: UnboundedSender<WithAddress>,
+    take_task: Mutex<Option<Task>>,
 }
 
 impl SharedUdpSocket {
@@ -50,76 +62,188 @@ impl SharedUdpSocket {
             socket: socket,
             with_addresses: Mutex::new(HashMap::new()),
             incoming_tx: tx,
+            take_task: Mutex::new(None),
         };
         SharedUdpSocket {
-            inner: Arc::new(inner),
-            incoming_rx: rx,
+            some: Some(SomeSharedUdpSocket {
+                inner: Arc::new(inner),
+                incoming_rx: rx,
+                buffer: BytesMut::new(),
+            }),
         }
     }
 
     /// Creates a `WithAddress` object which receives all packets that arrive from the given
-    /// address. `WithAddress` can also be used as a `Sink` to send packets. When the `WithAddress`
-    /// is dropped, any further or unprocessed packets arriving from the given address will instead
-    /// be received through the `SharedUdpSocket`.
-    ///
-    /// # Note:
-    /// 
-    /// You must continue to `poll` the `SharedUdpSocket` in order for packets to arrive on the
-    /// `WithAddress`
+    /// address. `WithAddress` can also be used as a `Sink` to send packets.
     pub fn with_address(&self, addr: SocketAddr) -> WithAddress {
-        let (tx, rx) = mpsc::unbounded();
-        let inner = self.inner.clone();
-        let ret = WithAddress {
-            inner: inner,
-            incoming_rx: rx,
-            addr: addr,
-        };
-        let mut with_addresses = unwrap!(self.inner.with_addresses.lock());
+        let some = unwrap!(self.some.as_ref());
+        let (tx, with_addr) = with_addr_new(&some.inner, addr);
+        let mut with_addresses = unwrap!(some.inner.with_addresses.lock());
         let _ = with_addresses.insert(addr, tx);
-        ret
+        with_addr
     }
 
-    fn process(&mut self, addr: SocketAddr, data: Bytes) -> io::Result<Async<Option<WithAddress>>> {
-        let mut with_addresses = unwrap!(self.inner.with_addresses.lock());
-        match with_addresses.entry(addr) {
-            hash_map::Entry::Occupied(mut oe) => {
-                match oe.get().unbounded_send(data) {
-                    Ok(()) => Ok(Async::NotReady),
-                    Err(send_error) => {
-                        let (tx, rx) = mpsc::unbounded();
-                        let inner = self.inner.clone();
-                        let ret = WithAddress {
-                            inner: inner,
-                            incoming_rx: rx,
-                            addr: addr,
-                        };
-
-                        unwrap!(tx.unbounded_send(send_error.into_inner()));
-                        let _ = mem::replace(oe.get_mut(), tx);
-                        Ok(Async::Ready(Some(ret)))
-                    },
-                }
-            },
-            hash_map::Entry::Vacant(ve) => {
-                let (tx, rx) = mpsc::unbounded();
-                let inner = self.inner.clone();
-                let ret = WithAddress {
-                    inner: inner,
-                    incoming_rx: rx,
-                    addr: addr,
-                };
-
-                unwrap!(tx.unbounded_send(data));
-                ve.insert(tx);
-                Ok(Async::Ready(Some(ret)))
-            },
-        }
+    /// Creates a future which yields the inner `UdpSocket` once all other references to the socket
+    /// have been dropped. If a `WithAddress` is already trying to take the socket (using
+    /// `WithAddress::try_take`) then this method will error, returning back the `SharedUdpSocket`.
+    pub fn try_take(mut self) -> Result<BoxFuture<UdpSocket, Void>, SharedUdpSocket> {
+        let some = unwrap!(self.some.take());
+        let incoming_rx = some.incoming_rx;
+        let buffer = some.buffer;
+        try_take(some.inner)
+        .map_err(move |inner| {
+            SharedUdpSocket {
+                some: Some(SomeSharedUdpSocket {
+                    inner,
+                    incoming_rx,
+                    buffer,
+                }),
+            }
+        })
     }
 }
 
+fn try_take(inner: Arc<SharedUdpSocketInner>) -> Result<BoxFuture<UdpSocket, Void>, Arc<SharedUdpSocketInner>> {
+    let inner = match Arc::try_unwrap(inner) {
+        Ok(inner) => return Ok(future::ok(inner.socket).into_boxed()),
+        Err(inner) => inner,
+    };
+
+    let someone_already_has_dibs = {
+        let mut take_task = unwrap!(inner.take_task.lock());
+        match *take_task {
+            Some(..) => true,
+            None => {
+                *take_task = Some(task::current());
+                false
+            },
+        }
+    };
+    if someone_already_has_dibs {
+        return Err(inner);
+    }
+
+    let inner = match Arc::try_unwrap(inner) {
+        Ok(inner) => return Ok(future::ok(inner.socket).into_boxed()),
+        Err(inner) => inner,
+    };
+
+    let mut inner = Some(inner);
+
+    Ok({
+        future::poll_fn(move || {
+            inner = match Arc::try_unwrap(unwrap!(inner.take())) {
+                Ok(inner) => return Ok(Async::Ready(inner.socket)),
+                Err(inner) => Some(inner),
+            };
+            Ok(Async::NotReady)
+        })
+        .into_boxed()
+    })
+}
+
+fn pump(inner: &Arc<SharedUdpSocketInner>, buffer: &mut BytesMut) -> io::Result<()> {
+    while let Async::Ready(()) = inner.socket.poll_read() {
+        let min_capacity = 64 * 1024 + 1;
+        let capacity = buffer.capacity();
+        if capacity < min_capacity {
+            buffer.reserve(min_capacity - capacity);
+        }
+        let capacity = buffer.capacity();
+        unsafe {
+            buffer.set_len(capacity)
+        }
+        match inner.socket.recv_from(&mut *buffer) {
+            Ok((n, addr)) => {
+                if n == buffer.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "failed to recv entire dgram",
+                    ));
+                }
+                let data = buffer.split_to(n).freeze();
+                let mut with_addresses = unwrap!(inner.with_addresses.lock());
+                let drop_after_unlock = match with_addresses.entry(addr) {
+                    hash_map::Entry::Occupied(mut oe) => {
+                        match oe.get().unbounded_send(data) {
+                            Ok(()) => None,
+                            Err(send_error) => {
+                                let (tx, with_addr) = with_addr_new(inner, addr);
+
+                                unwrap!(tx.unbounded_send(send_error.into_inner()));
+                                let _ = mem::replace(oe.get_mut(), tx);
+                                match inner.incoming_tx.unbounded_send(with_addr) {
+                                    Ok(()) => None,
+                                    Err(send_error) => Some(send_error.into_inner()),
+                                }
+                            },
+                        }
+                    },
+                    hash_map::Entry::Vacant(ve) => {
+                        let (tx, with_addr) = with_addr_new(inner, addr);
+
+                        unwrap!(tx.unbounded_send(data));
+                        ve.insert(tx);
+                        match inner.incoming_tx.unbounded_send(with_addr) {
+                            Ok(()) => None,
+                            Err(send_error) => Some(send_error.into_inner()),
+                        }
+                    },
+                };
+                drop(with_addresses);
+                drop(drop_after_unlock);
+            },
+            Err(e) => {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(e)
+            },
+        }
+    }
+
+    Ok(())
+}
+
+fn with_addr_new(inner: &Arc<SharedUdpSocketInner>, addr: SocketAddr) -> (UnboundedSender<Bytes>, WithAddress) {
+    let (tx, rx) = mpsc::unbounded();
+    let inner = inner.clone();
+    let with_addr = WithAddress {
+        some: Some(SomeWithAddress {
+            inner: inner,
+            incoming_rx: rx,
+            addr: addr,
+            buffer: BytesMut::new(),
+        }),
+    };
+    (tx, with_addr)
+}
+
 impl WithAddress {
+    /// Get the remote address that this `WithAddress` sends/receives packets to/from.
     pub fn remote_addr(&self) -> SocketAddr {
-        self.addr
+        let some = unwrap!(self.some.as_ref());
+        some.addr
+    }
+
+    /// Creates a future which returns the underlying `UdpSocket` once all other references to it
+    /// have been dropped.
+    pub fn try_take(mut self) -> Result<BoxFuture<UdpSocket, Void>, WithAddress> {
+        let some = unwrap!(self.some.take());
+        let incoming_rx = some.incoming_rx;
+        let addr = some.addr;
+        let buffer = some.buffer;
+        try_take(some.inner)
+        .map_err(move |inner| {
+            WithAddress {
+                some: Some(SomeWithAddress {
+                    inner,
+                    incoming_rx,
+                    addr,
+                    buffer,
+                }),
+            }
+        })
     }
 }
 
@@ -128,61 +252,22 @@ impl Stream for SharedUdpSocket {
     type Error = io::Error;
 
     fn poll(&mut self) -> io::Result<Async<Option<WithAddress>>> {
-        loop {
-            match self.incoming_rx.poll().void_unwrap() {
-                Async::Ready(Some((addr, data))) => {
-                    let res = self.process(addr, data);
-                    if let Ok(Async::NotReady) = res {
-                        continue;
-                    }
-                    return res;
-                },
-                Async::Ready(None) => unreachable!(),
-                Async::NotReady => break,
-            }
-        }
+        let some = unwrap!(self.some.as_mut());
+        pump(&some.inner, &mut some.buffer)?;
 
-        while let Async::Ready(()) = self.inner.socket.poll_read() {
-            let mut buff = [0; 64 * 1024 + 1];
-            match self.inner.socket.recv_from(&mut buff) {
-                Ok((n, addr)) => {
-                    if n == buff.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "failed to recv entire dgram",
-                        ));
-                    }
-                    let data = Bytes::from(&buff[..n]);
-
-                    let res = self.process(addr, data);
-                    if let Ok(Async::NotReady) = res {
-                        continue;
-                    }
-                    return res;
-                },
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        return Ok(Async::NotReady);
-                    }
-                    return Err(e)
-                },
-            }
-        }
-
-        Ok(Async::NotReady)
+        Ok(some.incoming_rx.poll().void_unwrap())
     }
 }
 
 impl Stream for WithAddress {
     type Item = Bytes;
-    type Error = ();
+    type Error = io::Error;
 
-    fn poll(&mut self) -> Result<Async<Option<Bytes>>, ()> {
-        match self.incoming_rx.poll().void_unwrap() {
-            Async::Ready(Some(data)) => Ok(Async::Ready(Some(data))),
-            Async::Ready(None) => Err(()),
-            Async::NotReady => Ok(Async::NotReady),
-        }
+    fn poll(&mut self) -> io::Result<Async<Option<Bytes>>> {
+        let some = unwrap!(self.some.as_mut());
+        pump(&some.inner, &mut some.buffer)?;
+
+        Ok(some.incoming_rx.poll().void_unwrap())
     }
 }
 
@@ -191,8 +276,10 @@ impl Sink for WithAddress {
     type SinkError = io::Error;
 
     fn start_send(&mut self, item: Bytes) -> io::Result<AsyncSink<Bytes>> {
-        if let Async::Ready(()) = self.inner.socket.poll_write() {
-            match self.inner.socket.send_to(&item, &self.addr) {
+        let some = unwrap!(self.some.as_mut());
+
+        if let Async::Ready(()) = some.inner.socket.poll_write() {
+            match some.inner.socket.send_to(&item, &some.addr) {
                 Ok(n) => {
                     if n != item.len() {
                         return Err(io::Error::new(
@@ -218,14 +305,28 @@ impl Sink for WithAddress {
     }
 }
 
+impl Drop for SharedUdpSocket {
+    fn drop(&mut self) {
+        if let Some(some) = self.some.take() {
+            let take_task = unwrap!(some.inner.take_task.lock());
+            if let Some(task) = take_task.as_ref() {
+                task.notify();
+            }
+        }
+    }
+}
+
 impl Drop for WithAddress {
     fn drop(&mut self) {
-        let mut with_addresses = unwrap!(self.inner.with_addresses.lock());
-        let _ = with_addresses.remove(&self.addr);
-        drop(with_addresses);
-
-        while let Async::Ready(Some(data)) = self.incoming_rx.poll().void_unwrap() {
-            let _ = self.inner.incoming_tx.unbounded_send((self.addr, data));
+        if let Some(some) = self.some.take() {
+            {
+                let mut with_addresses = unwrap!(some.inner.with_addresses.lock());
+                let _ = with_addresses.remove(&some.addr);
+            }
+            let take_task = unwrap!(some.inner.take_task.lock());
+            if let Some(task) = take_task.as_ref() {
+                task.notify();
+            }
         }
     }
 }
@@ -233,7 +334,7 @@ impl Drop for WithAddress {
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::Future;
+    use futures::{IntoFuture, Future};
 
     #[test]
     fn test() {
@@ -263,7 +364,7 @@ mod test {
 
                     with_addr0
                     .into_future()
-                    .map_err(|((), _)| panic!())
+                    .map_err(|(e, _)| panic!("{}", e))
                     .and_then(move |(opt, with_addr0)| {
                         let data = unwrap!(opt);
                         assert_eq!(&data[..], b"qqqq");
@@ -282,40 +383,42 @@ mod test {
                                 .and_then(move |(opt, shared)| {
                                     let with_addr1 = unwrap!(opt);
                                     assert_eq!(with_addr1.remote_addr(), addr1);
+                                    drop(shared);
 
                                     with_addr1
                                     .into_future()
-                                    .map_err(|((), _)| panic!())
+                                    .map_err(|(e, _)| panic!("{}", e))
                                     .and_then(move |(opt, _with_addr1)| {
                                         let data = unwrap!(opt);
                                         assert_eq!(&data[..], b"eeee");
-                                        drop(with_addr0);
 
-                                        shared
+                                        with_addr0
                                         .into_future()
                                         .map_err(|(e, _)| panic!("{}", e))
-                                        .and_then(move |(opt, _shared)| {
-                                            let with_addr0 = unwrap!(opt);
-                                            assert_eq!(with_addr0.remote_addr(), addr0);
+                                        .and_then(move |(opt, with_addr0)| {
+                                            let data = unwrap!(opt);
+                                            assert_eq!(&data[..], b"wwww");
 
                                             with_addr0
-                                            .into_future()
-                                            .map_err(|((), _)| panic!())
-                                            .and_then(move |(opt, with_addr0)| {
-                                                let data = unwrap!(opt);
-                                                assert_eq!(&data[..], b"wwww");
+                                            .send(Bytes::from(&b"rrrr"[..]))
+                                            .and_then(move |with_addr0| {
+                                                let buff = [0; 10];
 
-                                                with_addr0
-                                                .send(Bytes::from(&b"rrrr"[..]))
-                                                .and_then(move |_with_addr0| {
-                                                    let buff = [0; 10];
+                                                sock0
+                                                .recv_dgram(buff)
+                                                .map_err(|e| panic!("{}", e))
+                                                .and_then(move |(_sock0, data, len, addr)| {
+                                                    assert_eq!(addr, shared_addr);
+                                                    assert_eq!(&data[..len], b"rrrr");
 
-                                                    sock0
-                                                    .recv_dgram(buff)
-                                                    .map_err(|e| panic!("{}", e))
-                                                    .map(move |(_sock0, data, len, addr)| {
-                                                        assert_eq!(addr, shared_addr);
-                                                        assert_eq!(&data[..len], b"rrrr");
+                                                    with_addr0
+                                                    .try_take()
+                                                    .into_future()
+                                                    .map_err(|_| panic!())
+                                                    .and_then(|f| {
+                                                        f
+                                                        .infallible()
+                                                        .map(|_socket| ())
                                                     })
                                                 })
                                             })
