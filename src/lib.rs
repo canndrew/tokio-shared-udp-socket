@@ -8,18 +8,18 @@ extern crate void;
 #[cfg(test)]
 #[macro_use]
 extern crate net_literals;
+#[macro_use]
+extern crate log;
 
 use std::{mem, io};
 use std::collections::{hash_map, HashMap};
 use std::sync::{Arc, Mutex};
 use std::net::SocketAddr;
 use bytes::{BytesMut, Bytes};
-use futures::{future, Async, AsyncSink, Stream, Sink};
-use futures::task::{self, Task};
+use futures::{Async, AsyncSink, Stream, Sink};
 use future_utils::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use future_utils::{BoxFuture, FutureExt};
 use tokio_core::net::UdpSocket;
-use void::{Void, ResultVoidExt};
+use void::{ResultVoidExt};
 
 /// A UDP socket that can easily be shared amongst a bunch of different futures.
 pub struct SharedUdpSocket {
@@ -48,21 +48,20 @@ struct SomeWithAddress {
 }
 
 struct SharedUdpSocketInner {
-    socket: UdpSocket,
+    socket: Mutex<Option<UdpSocket>>,
     with_addresses: Mutex<HashMap<SocketAddr, UnboundedSender<Bytes>>>,
-    incoming_tx: UnboundedSender<WithAddress>,
-    take_task: Mutex<Option<Task>>,
+    incoming_tx: Mutex<Option<UnboundedSender<WithAddress>>>,
 }
 
 impl SharedUdpSocket {
     /// Create a new `SharedUdpSocket` from a `UdpSocket`.
     pub fn share(socket: UdpSocket) -> SharedUdpSocket {
+        trace!("creating shared udp socket on address {:?}", socket.local_addr());
         let (tx, rx) = mpsc::unbounded();
         let inner = SharedUdpSocketInner {
-            socket: socket,
+            socket: Mutex::new(Some(socket)),
             with_addresses: Mutex::new(HashMap::new()),
-            incoming_tx: tx,
-            take_task: Mutex::new(None),
+            incoming_tx: Mutex::new(Some(tx)),
         };
         SharedUdpSocket {
             some: Some(SomeSharedUdpSocket {
@@ -83,75 +82,38 @@ impl SharedUdpSocket {
         with_addr
     }
 
-    /// Creates a future which yields the inner `UdpSocket` once all other references to the socket
-    /// have been dropped. If a `WithAddress` is already trying to take the socket (using
-    /// `WithAddress::try_take`) then this method will error, returning back the `SharedUdpSocket`.
-    /// After calling this method, all other `SharedUdpSocket` and `WithAddress` streams that are
-    /// reading from the socket will end.
-    pub fn try_take(mut self) -> Result<BoxFuture<UdpSocket, Void>, SharedUdpSocket> {
+    /// Steals the udp socket (if it hasn't already been stolen) causing all other
+    /// `SharedUdpSocket` and `WithAddress` streams to end.
+    pub fn steal(mut self) -> Option<UdpSocket> {
         let some = unwrap!(self.some.take());
-        let incoming_rx = some.incoming_rx;
-        let buffer = some.buffer;
-        try_take(some.inner)
-        .map_err(move |inner| {
-            SharedUdpSocket {
-                some: Some(SomeSharedUdpSocket {
-                    inner,
-                    incoming_rx,
-                    buffer,
-                }),
-            }
-        })
+        let mut socket_opt = unwrap!(some.inner.socket.lock());
+        socket_opt.take()
     }
 
-    /// Get a reference to the inner `UdpSocket`
-    pub fn get_ref(&self) -> &UdpSocket {
+    pub fn ttl(&self) -> io::Result<u32> {
         let some = unwrap!(self.some.as_ref());
-        &some.inner.socket
-    }
-}
-
-fn try_take(inner: Arc<SharedUdpSocketInner>) -> Result<BoxFuture<UdpSocket, Void>, Arc<SharedUdpSocketInner>> {
-    let inner = match Arc::try_unwrap(inner) {
-        Ok(inner) => return Ok(future::ok(inner.socket).into_boxed()),
-        Err(inner) => inner,
-    };
-
-    let someone_already_has_dibs = {
-        let mut take_task = unwrap!(inner.take_task.lock());
-        match *take_task {
-            Some(..) => true,
-            None => {
-                *take_task = Some(task::current());
-                false
-            },
-        }
-    };
-    if someone_already_has_dibs {
-        return Err(inner);
+        some.inner.ttl()
     }
 
-    let inner = match Arc::try_unwrap(inner) {
-        Ok(inner) => return Ok(future::ok(inner.socket).into_boxed()),
-        Err(inner) => inner,
-    };
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        let some = unwrap!(self.some.as_ref());
+        some.inner.set_ttl(ttl)
+    }
 
-    let mut inner = Some(inner);
-
-    Ok({
-        future::poll_fn(move || {
-            inner = match Arc::try_unwrap(unwrap!(inner.take())) {
-                Ok(inner) => return Ok(Async::Ready(inner.socket)),
-                Err(inner) => Some(inner),
-            };
-            Ok(Async::NotReady)
-        })
-        .into_boxed()
-    })
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        let some = unwrap!(self.some.as_ref());
+        some.inner.local_addr()
+    }
 }
 
 fn pump(inner: &Arc<SharedUdpSocketInner>, buffer: &mut BytesMut) -> io::Result<()> {
-    while let Async::Ready(()) = inner.socket.poll_read() {
+    let socket_opt = unwrap!(inner.socket.lock());
+    let socket = match *socket_opt {
+        Some(ref socket) => socket,
+        None => return Ok(()),
+    };
+
+    while let Async::Ready(()) = socket.poll_read() {
         let min_capacity = 64 * 1024 + 1;
         let capacity = buffer.capacity();
         if capacity < min_capacity {
@@ -161,7 +123,7 @@ fn pump(inner: &Arc<SharedUdpSocketInner>, buffer: &mut BytesMut) -> io::Result<
         unsafe {
             buffer.set_len(capacity)
         }
-        match inner.socket.recv_from(&mut *buffer) {
+        match socket.recv_from(&mut *buffer) {
             Ok((n, addr)) => {
                 if n == buffer.len() {
                     return Err(io::Error::new(
@@ -176,25 +138,33 @@ fn pump(inner: &Arc<SharedUdpSocketInner>, buffer: &mut BytesMut) -> io::Result<
                         match oe.get().unbounded_send(data) {
                             Ok(()) => None,
                             Err(send_error) => {
-                                let (tx, with_addr) = with_addr_new(inner, addr);
+                                if let Some(ref incoming_tx) = *unwrap!(inner.incoming_tx.lock()) {
+                                    let (tx, with_addr) = with_addr_new(inner, addr);
 
-                                unwrap!(tx.unbounded_send(send_error.into_inner()));
-                                let _ = mem::replace(oe.get_mut(), tx);
-                                match inner.incoming_tx.unbounded_send(with_addr) {
-                                    Ok(()) => None,
-                                    Err(send_error) => Some(send_error.into_inner()),
+                                    unwrap!(tx.unbounded_send(send_error.into_inner()));
+                                    let _ = mem::replace(oe.get_mut(), tx);
+                                    match incoming_tx.unbounded_send(with_addr) {
+                                        Ok(()) => None,
+                                        Err(send_error) => Some(send_error.into_inner()),
+                                    }
+                                } else {
+                                    None
                                 }
                             },
                         }
                     },
                     hash_map::Entry::Vacant(ve) => {
-                        let (tx, with_addr) = with_addr_new(inner, addr);
+                        if let Some(ref incoming_tx) = *unwrap!(inner.incoming_tx.lock()) {
+                            let (tx, with_addr) = with_addr_new(inner, addr);
 
-                        unwrap!(tx.unbounded_send(data));
-                        ve.insert(tx);
-                        match inner.incoming_tx.unbounded_send(with_addr) {
-                            Ok(()) => None,
-                            Err(send_error) => Some(send_error.into_inner()),
+                            unwrap!(tx.unbounded_send(data));
+                            ve.insert(tx);
+                            match incoming_tx.unbounded_send(with_addr) {
+                                Ok(()) => None,
+                                Err(send_error) => Some(send_error.into_inner()),
+                            }
+                        } else {
+                            None
                         }
                     },
                 };
@@ -234,32 +204,53 @@ impl WithAddress {
         some.addr
     }
 
-    /// Creates a future which returns the underlying `UdpSocket` once all other references to it
-    /// have been dropped.
-    /// After calling this method, all other `SharedUdpSocket` and `WithAddress` streams that are
-    /// reading from the socket will end.
-    pub fn try_take(mut self) -> Result<BoxFuture<UdpSocket, Void>, WithAddress> {
+    /// Steals the udp socket (if it hasn't already been stolen) causing all other
+    /// `SharedUdpSocket` and `WithAddress` streams to end.
+    pub fn steal(mut self) -> Option<UdpSocket> {
         let some = unwrap!(self.some.take());
-        let incoming_rx = some.incoming_rx;
-        let addr = some.addr;
-        let buffer = some.buffer;
-        try_take(some.inner)
-        .map_err(move |inner| {
-            WithAddress {
-                some: Some(SomeWithAddress {
-                    inner,
-                    incoming_rx,
-                    addr,
-                    buffer,
-                }),
-            }
-        })
+        let mut socket_opt = unwrap!(some.inner.socket.lock());
+        socket_opt.take()
     }
-    
-    /// Get a reference to the inner `UdpSocket`
-    pub fn get_ref(&self) -> &UdpSocket {
+
+    pub fn ttl(&self) -> io::Result<u32> {
         let some = unwrap!(self.some.as_ref());
-        &some.inner.socket
+        some.inner.ttl()
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        let some = unwrap!(self.some.as_ref());
+        some.inner.set_ttl(ttl)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        let some = unwrap!(self.some.as_ref());
+        some.inner.local_addr()
+    }
+}
+
+impl SharedUdpSocketInner {
+    pub fn ttl(&self) -> io::Result<u32> {
+        let socket_opt = unwrap!(self.socket.lock());
+        match *socket_opt {
+            Some(ref socket) => socket.ttl(),
+            None => Err(io::Error::new(io::ErrorKind::Other, "socket has been stolen")),
+        }
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        let socket_opt = unwrap!(self.socket.lock());
+        match *socket_opt {
+            Some(ref socket) => socket.set_ttl(ttl),
+            None => Err(io::Error::new(io::ErrorKind::Other, "socket has been stolen")),
+        }
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        let socket_opt = unwrap!(self.socket.lock());
+        match *socket_opt {
+            Some(ref socket) => socket.local_addr(),
+            None => Err(io::Error::new(io::ErrorKind::Other, "socket has been stolen")),
+        }
     }
 }
 
@@ -269,10 +260,6 @@ impl Stream for SharedUdpSocket {
 
     fn poll(&mut self) -> io::Result<Async<Option<WithAddress>>> {
         let some = unwrap!(self.some.as_mut());
-        if unwrap!(some.inner.take_task.lock()).is_some() {
-            return Ok(Async::Ready(None));
-        }
-
         pump(&some.inner, &mut some.buffer)?;
 
         Ok(some.incoming_rx.poll().void_unwrap())
@@ -285,9 +272,6 @@ impl Stream for WithAddress {
 
     fn poll(&mut self) -> io::Result<Async<Option<Bytes>>> {
         let some = unwrap!(self.some.as_mut());
-        if unwrap!(some.inner.take_task.lock()).is_some() {
-            return Ok(Async::Ready(None));
-        }
         pump(&some.inner, &mut some.buffer)?;
 
         Ok(some.incoming_rx.poll().void_unwrap())
@@ -301,8 +285,14 @@ impl Sink for WithAddress {
     fn start_send(&mut self, item: Bytes) -> io::Result<AsyncSink<Bytes>> {
         let some = unwrap!(self.some.as_mut());
 
-        if let Async::Ready(()) = some.inner.socket.poll_write() {
-            match some.inner.socket.send_to(&item, &some.addr) {
+        let socket_opt = unwrap!(some.inner.socket.lock());
+        let socket = match *socket_opt {
+            Some(ref socket) => socket,
+            None => return Err(io::ErrorKind::NotConnected.into()),
+        };
+
+        if let Async::Ready(()) = socket.poll_write() {
+            match socket.send_to(&item, &some.addr) {
                 Ok(n) => {
                     if n != item.len() {
                         return Err(io::Error::new(
@@ -331,10 +321,8 @@ impl Sink for WithAddress {
 impl Drop for SharedUdpSocket {
     fn drop(&mut self) {
         if let Some(some) = self.some.take() {
-            let take_task = unwrap!(some.inner.take_task.lock());
-            if let Some(task) = take_task.as_ref() {
-                task.notify();
-            }
+            let mut incoming_tx = unwrap!(some.inner.incoming_tx.lock());
+            *incoming_tx = None;
         }
     }
 }
@@ -342,14 +330,8 @@ impl Drop for SharedUdpSocket {
 impl Drop for WithAddress {
     fn drop(&mut self) {
         if let Some(some) = self.some.take() {
-            {
-                let mut with_addresses = unwrap!(some.inner.with_addresses.lock());
-                let _ = with_addresses.remove(&some.addr);
-            }
-            let take_task = unwrap!(some.inner.take_task.lock());
-            if let Some(task) = take_task.as_ref() {
-                task.notify();
-            }
+            let mut with_addresses = unwrap!(some.inner.with_addresses.lock());
+            let _ = with_addresses.remove(&some.addr);
         }
     }
 }
@@ -357,7 +339,7 @@ impl Drop for WithAddress {
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::{IntoFuture, Future};
+    use futures::Future;
 
     #[test]
     fn test() {
@@ -430,19 +412,10 @@ mod test {
                                                 sock0
                                                 .recv_dgram(buff)
                                                 .map_err(|e| panic!("{}", e))
-                                                .and_then(move |(_sock0, data, len, addr)| {
+                                                .map(move |(_sock0, data, len, addr)| {
                                                     assert_eq!(addr, shared_addr);
                                                     assert_eq!(&data[..len], b"rrrr");
-
-                                                    with_addr0
-                                                    .try_take()
-                                                    .into_future()
-                                                    .map_err(|_| panic!())
-                                                    .and_then(|f| {
-                                                        f
-                                                        .infallible()
-                                                        .map(|_socket| ())
-                                                    })
+                                                    assert!(with_addr0.steal().is_some());
                                                 })
                                             })
                                         })
