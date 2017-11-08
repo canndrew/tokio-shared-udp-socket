@@ -86,6 +86,8 @@ impl SharedUdpSocket {
     /// Creates a future which yields the inner `UdpSocket` once all other references to the socket
     /// have been dropped. If a `WithAddress` is already trying to take the socket (using
     /// `WithAddress::try_take`) then this method will error, returning back the `SharedUdpSocket`.
+    /// After calling this method, all other `SharedUdpSocket` and `WithAddress` streams that are
+    /// reading from the socket will end.
     pub fn try_take(mut self) -> Result<BoxFuture<UdpSocket, Void>, SharedUdpSocket> {
         let some = unwrap!(self.some.take());
         let incoming_rx = some.incoming_rx;
@@ -100,6 +102,12 @@ impl SharedUdpSocket {
                 }),
             }
         })
+    }
+
+    /// Get a reference to the inner `UdpSocket`
+    pub fn get_ref(&self) -> &UdpSocket {
+        let some = unwrap!(self.some.as_ref());
+        &some.inner.socket
     }
 }
 
@@ -228,6 +236,8 @@ impl WithAddress {
 
     /// Creates a future which returns the underlying `UdpSocket` once all other references to it
     /// have been dropped.
+    /// After calling this method, all other `SharedUdpSocket` and `WithAddress` streams that are
+    /// reading from the socket will end.
     pub fn try_take(mut self) -> Result<BoxFuture<UdpSocket, Void>, WithAddress> {
         let some = unwrap!(self.some.take());
         let incoming_rx = some.incoming_rx;
@@ -245,6 +255,12 @@ impl WithAddress {
             }
         })
     }
+    
+    /// Get a reference to the inner `UdpSocket`
+    pub fn get_ref(&self) -> &UdpSocket {
+        let some = unwrap!(self.some.as_ref());
+        &some.inner.socket
+    }
 }
 
 impl Stream for SharedUdpSocket {
@@ -253,6 +269,10 @@ impl Stream for SharedUdpSocket {
 
     fn poll(&mut self) -> io::Result<Async<Option<WithAddress>>> {
         let some = unwrap!(self.some.as_mut());
+        if unwrap!(some.inner.take_task.lock()).is_some() {
+            return Ok(Async::Ready(None));
+        }
+
         pump(&some.inner, &mut some.buffer)?;
 
         Ok(some.incoming_rx.poll().void_unwrap())
@@ -265,6 +285,9 @@ impl Stream for WithAddress {
 
     fn poll(&mut self) -> io::Result<Async<Option<Bytes>>> {
         let some = unwrap!(self.some.as_mut());
+        if unwrap!(some.inner.take_task.lock()).is_some() {
+            return Ok(Async::Ready(None));
+        }
         pump(&some.inner, &mut some.buffer)?;
 
         Ok(some.incoming_rx.poll().void_unwrap())
