@@ -172,10 +172,11 @@ fn pump(inner: &Arc<SharedUdpSocketInner>, buffer: &mut BytesMut) -> io::Result<
                 drop(drop_after_unlock);
             },
             Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(());
+                match e.kind() {
+                    io::ErrorKind::WouldBlock => return Ok(()),
+                    io::ErrorKind::ConnectionReset => continue,
+                    _ => return Err(e),
                 }
-                return Err(e)
             },
         }
     }
